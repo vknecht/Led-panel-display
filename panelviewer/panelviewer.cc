@@ -31,6 +31,7 @@ extern "C" {
 #  include <libavcodec/avcodec.h>
 #  include <libavformat/avformat.h>
 #  include <libswscale/swscale.h>
+#  include <libavutil/imgutils.h>
 }
 
 using rgb_matrix::GPIO;
@@ -239,12 +240,10 @@ short Video(const char movie_file[128], FrameCanvas *offscreen_canvas) {
   int               i, videoStream;
   AVCodecContext    *pCodecCtxOrig = NULL;
   AVCodecContext    *pCodecCtx = NULL;
-  AVCodec           *pCodec = NULL;
   AVPacket          packet;
-  int               frameFinished;
+  int               ret;
 
   // Register all formats and codecs
-  av_register_all();
   avformat_network_init();
 
   if (avformat_open_input(&pFormatCtx, movie_file, NULL, NULL) != 0) {
@@ -262,7 +261,7 @@ short Video(const char movie_file[128], FrameCanvas *offscreen_canvas) {
   // Find the first video stream
   videoStream=-1;
   for (i=0; i < (int)pFormatCtx->nb_streams; ++i) {
-    if (pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
+    if (pFormatCtx->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_VIDEO) {
       videoStream=i;
       break;
     }
@@ -270,23 +269,25 @@ short Video(const char movie_file[128], FrameCanvas *offscreen_canvas) {
   if (videoStream == -1)
     return -1; // Didn't find a video stream
 
-  // Get a pointer to the codec context for the video stream
-  pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
-  double fps = av_q2d(pFormatCtx->streams[videoStream]->avg_frame_rate);
-  if (fps < 0) {
-    fps = 1.0 / av_q2d(pFormatCtx->streams[videoStream]->codec->time_base);
-  }
-
   // Find the decoder for the video stream
-  pCodec=avcodec_find_decoder(pCodecCtxOrig->codec_id);
+  const AVCodec *pCodec=avcodec_find_decoder(pFormatCtx->streams[videoStream]->codecpar->codec_id);
   if (pCodec==NULL) {
     fprintf(stderr, "Unsupported codec!\n");
     return -1;
   }
+
+  // Get a pointer to the codec context for the video stream
+  pCodecCtxOrig = avcodec_alloc_context3(pCodec);
+  double fps = av_q2d(av_guess_frame_rate(pFormatCtx, pFormatCtx->streams[videoStream], NULL));
+  if (fps < 0) {
+    fps = 1.0 / av_q2d(pCodecCtxOrig->time_base); // (vk) check if still correct and  necessary...
+  }
+
   // Copy context
   pCodecCtx = avcodec_alloc_context3(pCodec);
-  if (avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
-    fprintf(stderr, "Couldn't copy codec context");
+  ret = avcodec_parameters_to_context(pCodecCtx, pFormatCtx->streams[videoStream]->codecpar);
+  if (ret < 0) {
+    fprintf(stderr, "Failed to copy decoder parameters to context\n");
     return -1;
   }
 
@@ -313,15 +314,14 @@ short Video(const char movie_file[128], FrameCanvas *offscreen_canvas) {
   const int display_offset_y = (matrix->height() - display_height)/2;
 
   // Allocate buffer to meet output size requirements
-  const size_t output_size = avpicture_get_size(AV_PIX_FMT_RGB24,
-                                           display_width,display_height);
-  uint8_t *output_buffer = (uint8_t *) av_malloc(output_size);
+  int output_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24,
+                                             display_width, display_height, 1);
+  uint8_t *output_buffer = (uint8_t *) av_malloc((size_t)output_size);
 
   // Assign appropriate parts of buffer to image planes in output_frame.
-  // Note that output_frame is an AVFrame, but AVFrame is a superset
-  // of AVPicture
-  avpicture_fill((AVPicture *)output_frame, output_buffer, AV_PIX_FMT_RGB24,
-                 display_width, display_height);
+  av_image_fill_arrays(output_frame->data, output_frame->linesize,
+                       (uint8_t *)output_buffer, AV_PIX_FMT_RGB24,
+                       display_width, display_height, 1);
 
   // initialize SWS context for software scaling
   SwsContext *const sws_ctx = CreateSWSContext(pCodecCtx,
@@ -357,25 +357,24 @@ short Video(const char movie_file[128], FrameCanvas *offscreen_canvas) {
         add_nanos(&next_frame, frame_wait_nanos);
         
         // Decode video frame
-        avcodec_decode_video2(pCodecCtx, decode_frame, &frameFinished, &packet);
+        avcodec_send_packet(pCodecCtx, &packet);
+        avcodec_receive_frame(pCodecCtx, decode_frame);
         
         if (frames_to_skip) { frames_to_skip--; continue; }
         
-        // Did we get a video frame?
-        if (frameFinished) {
-          // Convert the image from its native format to RGB
-          sws_scale(sws_ctx, (uint8_t const * const *)decode_frame->data,
-                    decode_frame->linesize, 0, pCodecCtx->height,
-                    output_frame->data, output_frame->linesize);
-          CopyFrame(output_frame, offscreen_canvas,
-                    display_offset_x, display_offset_y, display_width, display_height);
-          frame_count++;
-          offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas, vsync_multiple);
-        }
+        // Convert the image from its native format to RGB
+        sws_scale(sws_ctx, (uint8_t const * const *)decode_frame->data,
+                  decode_frame->linesize, 0, pCodecCtx->height,
+                  output_frame->data, output_frame->linesize);
+        CopyFrame(output_frame, offscreen_canvas,
+                  display_offset_x, display_offset_y, display_width, display_height);
+        frame_count++;
+        offscreen_canvas = matrix->SwapOnVSync(offscreen_canvas, vsync_multiple);
+
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
       }
       // Free the packet that was allocated by av_read_frame
-      av_free_packet(&packet);
+      av_packet_unref(&packet);
     }
   } while ( (!interrupt_received)&&(readed>=0) );
 
