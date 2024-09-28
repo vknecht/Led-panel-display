@@ -1340,7 +1340,7 @@ short q,r;
     }
     fclose(fp);
   }
-  return('\0');
+  return((char*)'\0');
 }
 //-----------------------------------------------------------------------
 //Lecture du texte complet à afficher
